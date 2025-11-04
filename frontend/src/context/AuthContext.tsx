@@ -4,6 +4,14 @@ import { app } from "../../../DB/firebase"; // 👈 asegúrate de apuntar correc
 import { loginWithGoogle, logout } from "../../../DB/fireauth"; // 👈 tus funciones
 import { addDocument, getDogsByOwner } from "../../../DB/firestoreService"; // helper para escribir en Firestore
 
+const API_BASE: string = (import.meta as any).env?.VITE_API_URL ?? '';
+
+const buildApiUrl = (path: string) => {
+  if (!API_BASE) return path;
+  const base = API_BASE.endsWith('/') ? API_BASE.slice(0, -1) : API_BASE;
+  return `${base}${path}`;
+};
+
 // Crear el contexto
 const AuthContext = createContext<{
   user: User | null;
@@ -74,21 +82,46 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       const dogWithOwner = {
         ...dogData,
-        ownerEmail/*,
-        ownerId,
-        ownerName,
-        createdAt: new Date().toISOString()*/
+        ownerEmail
       };
 
-      // Asegurarse de que la colección coincida con el resto del proyecto ("Perro")
-      const id = await addDocument("Perro", dogWithOwner);
-      console.log("Perro publicado con id:", id);
-      // Update local publishedDogs cache optimistically
-      try {
-        setPublishedDogs(prev => [...prev, { ...dogWithOwner, id }]);
-      } catch (e) {
-        // ignore
+      // Primero intentamos publicarlo a través del backend para que se dispare el flujo completo
+      if (API_BASE) {
+        try {
+          const token = await user?.getIdToken?.();
+          const response = await fetch(buildApiUrl('/api/dogs'), {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token ? { Authorization: `Bearer ${token}` } : {})
+            },
+            body: JSON.stringify(dogWithOwner)
+          });
+
+          if (!response.ok) {
+            const message = await response.text();
+            throw new Error(message || `Backend respondió ${response.status}`);
+          }
+
+          const payload = await response.json();
+          const createdDog = payload?.dog;
+          if (createdDog?.id) {
+            setPublishedDogs(prev => {
+              const withoutDuplicate = prev.filter(item => item.id !== createdDog.id);
+              return [...withoutDuplicate, createdDog];
+            });
+            return createdDog.id as string;
+          }
+        } catch (err) {
+          console.error('Error publicando perro mediante backend:', err);
+          // Si falla, continuamos con el fallback a Firestore directo.
+        }
       }
+
+      // Fallback directo a Firestore si no hay backend o hubo un error
+      const id = await addDocument("Perro", dogWithOwner);
+      console.log("Perro publicado con id (Firestore directo):", id);
+      setPublishedDogs(prev => [...prev, { ...dogWithOwner, id }]);
       return id;
     } catch (error) {
       console.error("Error publicando perro:", error);
@@ -104,7 +137,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return;
       }
       try {
-        const list = await getDogsByOwner(user.email ?? undefined);
+        const email = user.email ?? undefined;
+        if (!email) {
+          if (mounted) setPublishedDogs([]);
+          return;
+        }
+
+        if (API_BASE) {
+          try {
+            const url = buildApiUrl(`/api/dogs?ownerEmail=${encodeURIComponent(email)}`);
+            const resp = await fetch(url);
+            if (resp.ok) {
+              const data = await resp.json();
+              if (!mounted) return;
+              setPublishedDogs(Array.isArray(data?.dogs) ? data.dogs : []);
+              return;
+            }
+            console.warn('Fallo cargando publicaciones desde backend:', resp.status);
+          } catch (err) {
+            console.error('Error solicitando publicaciones al backend:', err);
+          }
+        }
+
+        const list = await getDogsByOwner(email);
         if (!mounted) return;
         setPublishedDogs(list);
       } catch (err) {
